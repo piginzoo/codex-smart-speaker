@@ -22,43 +22,57 @@ import org.vosk.Model
 import org.vosk.Recognizer
 import java.io.File
 import kotlin.concurrent.thread
+import kotlin.math.sqrt
 
 /**
- * 唤醒服务：前台服务24小时离线监听"Codex"。
- * 听到 → 亮屏 → 拉起ChatGPT → 通知辅助功能进语音模式。
+ * 唤醒服务：前台服务，双模式语音终端，单一中文耳朵架构。
  *
- * 关键设计：语音会话期间彻底释放麦克风（ChatGPT的WebRTC需要独占，
- * 三星机器上先到先得，抢麦会导致live连接饿死）。
- * 挂断检测由独立的看守线程负责：音频模式从"通话模式"回落=用户已挂断。
- * 会话结束后重建录音器恢复监听。
+ * 待机：一个中文全量ASR识别器持续识别，文字匹配两套唤醒词变体（配置文件热加载）：
+ *   - "小管家"变体   → GLM语音聊天模式（ChatDialogue：聊天+设/查/取消闹钟）
+ *   - "Hey Codex"变体（中文转写）→ 亮屏拉起ChatGPT live
+ * 为什么不用英文语法识别器：语法模式会把一切声音强行归类到词表（"小智"→codex误触发
+ * 三连），已彻底开除（踩坑#17）。英文"Codex"由中文ASR转写（嘿/科/德/克…）变体匹配。
+ *
+ * 聊天模式：同一识别器继续收语句 → glm-5.3-flash → TTS回话，可语音切换到ChatGPT。
+ * 麦克风独占协议：ChatGPT live会话期间彻底释放AudioRecord（三星先到先得）。
+ * 挂断检测：独立看守线程查音频模式回落（含10秒资历防开场抖动误判）。
+ * 死亡螺旋保险丝：partial超8秒强制重置（踩坑#16：长partial解码冻结）。
  */
 class WakeService : Service() {
 
     companion object {
         const val SAMPLE_RATE = 16000
-        const val WAKE_WORD = "codex"
         @Volatile var instance: WakeService? = null
     }
 
     private lateinit var workThread: HandlerThread
     private lateinit var handler: Handler
-    private var model: Model? = null
-    private var recognizer: Recognizer? = null
+    private var cnModel: Model? = null
+    private var cnRecognizer: Recognizer? = null
     @Volatile private var running = false
     private var lastTriggerAt = 0L
-    private var lastLoggedText = ""
-    @Volatile private var lastBeatAt = 0L   // 心跳：mic循环每次迭代刷新，看门狗据此判断假死
+    private var lastCnLogged = ""
+    private var cnPartialSince = 0L
+    @Volatile private var lastBeatAt = 0L
 
-    /** 语法约束：识别器只输出这些词，环境音全部变成[unk]，防止长partial拖死识别器 */
-    private val grammar = "[\"[unk]\", \"hey codex\", \"codex\", \"kodak\", \"kodaks\", \"codecs\", \"codaks\", \"hey\", \"huh\"]"
+    private var chatTriggers: List<String> = listOf("小管家")           // 唤醒GLM聊天
+    private var codexVariants: List<String> = listOf("科德克斯")         // 唤醒ChatGPT
+    @Volatile private var codexTriggerSeen = false
+    @Volatile private var codexTriggerSeenAt = 0L
 
     fun isHealthy(): Boolean =
         running && (SystemClock.elapsedRealtime() - lastBeatAt) < 30_000
 
-    // 挂断看守：通话模式见过后回落到正常=会话结束
+    /** 调试用：外部触发配置重载 */
+    fun loadConfigsPublic() { loadConfigs() }
+
+    // 挂断看守
     private var commSeen = false
+    private var commStartedAt = 0L
     private var normalStreak = 0
+    private var stuckCommCount = 0
     private var lastModeLog = 0L
+    private var lastCfgCheck = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -72,15 +86,14 @@ class WakeService : Service() {
         workThread = HandlerThread("wake-engine").also { it.start() }
         handler = Handler(workThread.looper)
         handler.post { initModel() }
-        handler.post(hangupWatcher)   // 独立看守线程：不占麦克风
-        ButlerWatchdogReceiver.scheduleNext(this)  // 看门狗巡视启动
-        Butler.status = "唤醒服务运行中"
+        handler.post(hangupWatcher)
+        ButlerWatchdogReceiver.scheduleNext(this)
+        Butler.status = "双模式待机：Hey Codex→ChatGPT，小管家→GLM聊天"
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // 用户从最近任务划掉App：1秒后自动拉活服务
         FileLog.log("onTaskRemoved：安排1秒后重启")
         try {
             val am = getSystemService(AlarmManager::class.java)
@@ -102,8 +115,8 @@ class WakeService : Service() {
         Butler.releaseScreen()
         FileLog.log("WakeService onDestroy")
         handler.post {
-            try { recognizer?.close() } catch (_: Exception) {}
-            try { model?.close() } catch (_: Exception) {}
+            try { cnRecognizer?.close() } catch (_: Exception) {}
+            try { cnModel?.close() } catch (_: Exception) {}
         }
         workThread.quitSafely()
         instance = null
@@ -120,25 +133,25 @@ class WakeService : Service() {
         )
         val n = Notification.Builder(this, "butler")
             .setContentTitle("语音管家")
-            .setContentText("正在监听唤醒词「Codex」")
+            .setContentText("待机中：「Hey Codex」→ChatGPT，「小管家」→语音聊天")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .build()
         startForeground(1, n)
     }
 
-    /** 加载Vosk模型，路径：/sdcard/Android/data/com.piginzoo.butler/files/vosk-model-small-en-us-0.15 */
     private fun initModel() {
-        val modelPath = File(getExternalFilesDir(null), "vosk-model-small-en-us-0.15")
-        if (!File(modelPath, "am/final.mdl").exists() && !File(modelPath, "final.mdl").exists()) {
-            Butler.status = "模型缺失：请先用adb推送模型到 ${modelPath.absolutePath}"
+        val cnPath = File(getExternalFilesDir(null), "vosk-model-small-cn-0.22")
+        if (!File(cnPath, "am/final.mdl").exists()) {
+            Butler.status = "中文模型缺失：${cnPath.absolutePath}"
             return
         }
         try {
-            model = Model(modelPath.absolutePath)
+            cnModel = Model(cnPath.absolutePath)
+            loadConfigs()
             running = true
-            FileLog.log("模型加载完成，语法约束识别启动")
-            Butler.status = "模型加载完成，开始监听"
+            FileLog.log("模型加载完成：cn✓ 聊天触发词${chatTriggers.size}个 Codex变体${codexVariants.size}个")
+            Butler.status = "模型加载完成，双模式待机"
             thread(name = "mic-loop") { listenLoop() }
         } catch (e: Exception) {
             FileLog.log("模型加载失败：${e.message}")
@@ -146,35 +159,52 @@ class WakeService : Service() {
         }
     }
 
-    private fun newRecognizer(): Recognizer? {
-        val m = model ?: return null
-        return try { Recognizer(m, SAMPLE_RATE.toFloat(), grammar) } catch (e: Exception) { null }
+    /** 配置文件热加载（30秒一次），改词表不用重装App */
+    private fun loadConfigs() {
+        val base = getExternalFilesDir(null)
+        chatTriggers = try {
+            val f = File(base, "chat_triggers.txt")
+            if (!f.exists()) f.writeText("小管家\n小管加\n小官家")
+            f.readLines().map { it.trim().replace(" ", "") }.filter { it.isNotEmpty() }
+        } catch (e: Exception) { listOf("小管家") }
+        codexVariants = try {
+            val f = File(base, "codex_variants.txt")
+            if (!f.exists()) f.writeText("科德克斯\n扣德克斯\n考德克斯\n科代克斯\n嘿科德\n科迪斯\n口德克")
+            f.readLines().map { it.trim().replace(" ", "") }.filter { it.isNotEmpty() }
+        } catch (e: Exception) { listOf("科德克斯") }
+    }
+
+    private fun newCnRecognizer(): Recognizer? {
+        val m = cnModel ?: return null
+        return try { Recognizer(m, SAMPLE_RATE.toFloat()) } catch (e: Exception) { null }
     }
 
     private fun audioManager() = getSystemService(AudioManager::class.java)
 
-    /**
-     * 挂断看守线程：会话期间每秒查一次系统音频模式。
-     * ChatGPT语音会话开着时mode=MODE_IN_COMMUNICATION；用户挂断后回落MODE_NORMAL。
-     * 连续5次回落即判定会话结束。此线程完全不碰麦克风。
-     */
+    /** 挂断看守线程：音频模式回落=用户已挂断（10秒资历防开场抖动）；
+     *  兼职：30秒热加载一次配置文件；无会话时音频模式卡死归位 */
     private val hangupWatcher = object : Runnable {
         override fun run() {
             if (!running) return
             try {
+                val now = System.currentTimeMillis()
+                if (now - lastCfgCheck > 30_000) {
+                    lastCfgCheck = now
+                    loadConfigs()   // 词表热加载
+                }
                 if (Butler.sessionActive) {
                     val mode = audioManager().mode
                     if (mode == AudioManager.MODE_IN_COMMUNICATION) {
+                        if (!commSeen) commStartedAt = now
                         commSeen = true
                         normalStreak = 0
-                    } else if (commSeen) {
-                        if (++normalStreak >= 5) {
+                    } else if (commSeen && now - commStartedAt > 10_000) {
+                        if (++normalStreak >= 10) {
                             exitSession("音频模式回落(用户已挂断)")
                             normalStreak = 0
                             commSeen = false
                         }
                     }
-                    val now = System.currentTimeMillis()
                     if (now - lastModeLog > 5000) {
                         lastModeLog = now
                         android.util.Log.d("ButlerWake", "watcher: mode=$mode commSeen=$commSeen")
@@ -182,6 +212,17 @@ class WakeService : Service() {
                 } else {
                     commSeen = false
                     normalStreak = 0
+                    // 自愈：无会话但音频模式卡在通话模式（ChatGPT App启动残留）→录音流死寂（聋病根）
+                    val m = audioManager().mode
+                    if (m == AudioManager.MODE_IN_COMMUNICATION) {
+                        if (++stuckCommCount >= 5) {
+                            try {
+                                audioManager().mode = AudioManager.MODE_NORMAL
+                                FileLog.log("音频模式卡死通话态，已强制归位NORMAL")
+                            } catch (e: Exception) { FileLog.log("归位失败: ${e.message}") }
+                            stuckCommCount = 0
+                        }
+                    } else stuckCommCount = 0
                 }
             } catch (_: Exception) {}
             handler.postDelayed(this, 1000)
@@ -192,15 +233,18 @@ class WakeService : Service() {
         val buf = ShortArray(3200) // 200ms
         while (running) {
             lastBeatAt = SystemClock.elapsedRealtime()
-            // 会话刚结束：歇1秒换新录音器，避免音频路由残留
             if (Butler.micRestartRequested) {
                 Butler.micRestartRequested = false
                 FileLog.log("mic-loop: 会话结束，重建录音器")
                 SystemClock.sleep(1000)
                 continue
             }
-            // 语音会话期间彻底让出麦克风（ChatGPT的WebRTC需要独占，三星机器上先到先得，抢麦会导致live连接饿死）
+            // ChatGPT live会话期间彻底让出麦克风
             if (Butler.sessionActive) {
+                SystemClock.sleep(1500)
+                continue
+            }
+            if (Butler.micFree) {
                 SystemClock.sleep(1500)
                 continue
             }
@@ -209,52 +253,103 @@ class WakeService : Service() {
             try { recorder.startRecording() } catch (e: Exception) {
                 recorder.release(); SystemClock.sleep(3000); continue
             }
-            var recognizer = newRecognizer()
+            var cnRecognizer = newCnRecognizer()
             var failedReads = 0
+            var utteranceMaxRms = 0.0
             FileLog.log("mic-loop: 本轮监听开始")
-            // 本轮监听（会话一旦开始立即退出本轮）
             while (running) {
                 lastBeatAt = SystemClock.elapsedRealtime()
-                if (Butler.sessionActive || Butler.micRestartRequested) break
+                if (Butler.sessionActive || Butler.micRestartRequested || Butler.micFree) break
                 val n = try { recorder.read(buf, 0, buf.size) } catch (e: Exception) { -1 }
                 if (n <= 0) {
                     if (++failedReads > 15) break
                     SystemClock.sleep(200); continue
                 }
                 failedReads = 0
-                var rec = recognizer
-                if (rec == null) { rec = newRecognizer(); recognizer = rec }
-                if (rec == null) { SystemClock.sleep(1000); continue }
-                val hasFinal = try { rec.acceptWaveForm(buf, n) } catch (e: Exception) { false }
-                val text = extractText(rec, hasFinal)
-                // partial超长保险丝：语法模式下理论不会发生，防御性保留
-                if (!hasFinal && text != null && text.split(Regex("\\s+")).size > 10) {
-                    FileLog.log("partial超长(${text.split(Regex("\\s+")).size}词)，重置识别器")
-                    try { rec.reset() } catch (_: Exception) {}
+                // TTS回声静默期：自己念的话+结束后800ms内不喂识别器（防回声进对话）
+                if (ButlerTts.speaking || SystemClock.elapsedRealtime() < ButlerTts.muteUntilElapsed) continue
+
+                var cnRec = cnRecognizer
+                if (cnRec == null) { cnRec = newCnRecognizer(); cnRecognizer = cnRec }
+                if (cnRec == null) { SystemClock.sleep(1000); continue }
+                val cnFinal = try { cnRec.acceptWaveForm(buf, n) } catch (e: Exception) { false }
+                val cnText = extractText(cnRec, cnFinal)
+                if (cnText.isNullOrEmpty()) continue
+
+                if (Butler.chatDialogueActive) {
+                    // 对话模式：静音端点=一句话说完，交给GLM；能量门过滤环境音/回声
+                    var sum = 0.0
+                    for (s in buf) sum += s.toDouble() * s
+                    val rms = sqrt(sum / buf.size)
+                    if (rms > 250) utteranceMaxRms = maxOf(utteranceMaxRms, rms)
+                    if (cnFinal && !cnText.isNullOrBlank()) {
+                        if (utteranceMaxRms > 250) ChatDialogue.onUtterance(cnText)
+                        else FileLog.log("低能量utterance丢弃: \"$cnText\"")
+                        utteranceMaxRms = 0.0
+                    }
+                    continue
                 }
-                if (!text.isNullOrEmpty() && text != lastLoggedText) {
-                    lastLoggedText = text
-                    android.util.Log.d("ButlerWake", "识别: $text")
+
+                // 死亡螺旋保险丝：partial挂起超8秒强制重置（长语音解码冻结，踩坑#16）
+                if (cnPartialSince == 0L) cnPartialSince = System.currentTimeMillis()
+                if (System.currentTimeMillis() - cnPartialSince > 8000) {
+                    try { cnRec.reset() } catch (_: Exception) {}
+                    cnPartialSince = 0
+                    FileLog.log("cn partial超8秒，强制重置")
+                    continue
                 }
-                if (text != null && containsWakeWord(text)) {
+
+                // 诊断日志：待机时记录中文识别真实输出（变体表按实测调）
+                if (cnText != lastCnLogged) {
+                    lastCnLogged = cnText
+                    FileLog.log("cn识别: $cnText")
+                }
+
+                val clean = cnText.replace(" ", "")
+                if (matchList(clean, chatTriggers)) {
+                    cnPartialSince = 0
+                    Butler.chatDialogueActive = true
+                    FileLog.log("触发小管家: \"$cnText\"")
+                    thread(name = "chat-dlg") {
+                        val wantCodex = ChatDialogue.start(this@WakeService, cnText)
+                        loadConfigs()
+                        if (wantCodex) {
+                            lastTriggerAt = System.currentTimeMillis()
+                            commSeen = false; normalStreak = 0
+                            Butler.triggerSession(this@WakeService)
+                        }
+                    }
+                    continue
+                }
+                if (matchList(clean, codexVariants) && !codexTriggerSeen) {
+                    codexTriggerSeen = true
+                    codexTriggerSeenAt = System.currentTimeMillis()
+                }
+                if (cnFinal && codexTriggerSeen) {
+                    codexTriggerSeen = false
                     maybeTrigger()
                 }
             }
             // 收拾本轮：彻底释放
             try { recorder.stop() } catch (_: Exception) {}
             recorder.release()
-            try { recognizer?.close() } catch (_: Exception) {}
-            recognizer = null
+            try { cnRecognizer?.close() } catch (_: Exception) {}
+            cnRecognizer = null
+            cnPartialSince = 0
             if (running) SystemClock.sleep(800)
         }
     }
+
+    /** 匹配：文本含任一变体（去空格比对） */
+    private fun matchList(text: String, list: List<String>): Boolean =
+        list.any { text.contains(it.replace(" ", "")) }
 
     private fun openRecorder(): AudioRecord? = try {
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
         AudioRecord(
-            MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minBuf * 4, 32000)
         ).takeIf { it.state == AudioRecord.STATE_INITIALIZED }
@@ -265,31 +360,18 @@ class WakeService : Service() {
         JSONObject(json).optString(if (hasFinal) "text" else "partial")
     } catch (e: Exception) { null }
 
-    /** 唤醒词匹配：按非字母切词，匹配codex及其常见误听变体（Vosk小模型对合成音不稳） */
-    private val wakeVariants = setOf("codex", "kodak", "kodaks", "codecs", "codaks", "codexs")
-
-    private fun containsWakeWord(text: String): Boolean {
-        if (Butler.sessionActive || Butler.pendingEnterVoice) return false
-        val words = text.lowercase().split(Regex("[^a-z]+"))
-        return words.any { it in wakeVariants }
-    }
-
     private fun maybeTrigger() {
         android.util.Log.d("ButlerWake", "maybeTrigger: sessionActive=${Butler.sessionActive} pending=${Butler.pendingEnterVoice}")
         FileLog.log("maybeTrigger: session=${Butler.sessionActive} pending=${Butler.pendingEnterVoice}")
         val now = System.currentTimeMillis()
-        if (now - lastTriggerAt < 10_000) return  // 防抖10秒
+        if (now - lastTriggerAt < 10_000) return
         lastTriggerAt = now
         commSeen = false
         normalStreak = 0
-        Butler.status = "听到唤醒词！"
+        Butler.status = "听到Hey Codex！"
         Butler.triggerSession(this)
     }
 
-    /**
-     * 结束会话：退出live模式+回桌面+复位状态+申请重建录音器。
-     * 退出的全局动作由辅助功能服务执行（不依赖界面事件）。
-     */
     private fun exitSession(reason: String) {
         if (!Butler.sessionActive) return
         Butler.sessionActive = false
@@ -300,7 +382,6 @@ class WakeService : Service() {
         Butler.micRestartRequested = true
         val s = ButlerAccessibilityService.instance
         if (s != null) {
-            // BACK退出live模式 → 1.2秒后HOME回桌面
             s.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             Handler(Looper.getMainLooper()).postDelayed({
                 if (!Butler.sessionActive) {
@@ -314,7 +395,6 @@ class WakeService : Service() {
         }
     }
 
-    /** MainActivity"测试唤醒流程"按钮调用：跳过听词直接走全流程 */
     fun testTrigger() {
         lastTriggerAt = System.currentTimeMillis()
         commSeen = false

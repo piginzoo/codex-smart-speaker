@@ -24,6 +24,28 @@ object Butler {
     /** 唤醒服务申请重建录音器（会话结束/挂断后） */
     @Volatile var micRestartRequested = false
 
+    /** 小智对话模式进行中（GLM语音聊天） */
+    @Volatile var chatDialogueActive = false
+
+    /** 手动让出麦克风（给Bixby等别的助手用），10分钟后自动恢复 */
+    @Volatile var micFree = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun setMicFree(context: Context, free: Boolean) {
+        micFree = free
+        status = if (free) "麦克风已让出（10分钟后自动恢复）" else "麦克风恢复监听"
+        FileLog.log("micFree=$free")
+        if (free) {
+            mainHandler.postDelayed({
+                if (micFree) {
+                    micFree = false
+                    status = "麦克风自动恢复监听"
+                    FileLog.log("micFree 10分钟超时自动恢复")
+                }
+            }, 10 * 60 * 1000L)
+        }
+    }
+
     /** 界面状态文案，MainActivity展示用 */
     @Volatile var status: String = "未启动"
         set(value) { field = value; listener?.invoke(value) }
@@ -52,6 +74,12 @@ object Butler {
 
     fun triggerSession(context: Context) {
         if (sessionActive || pendingEnterVoice) return
+        if (!a11yReady) {
+            // 辅助功能没就绪时启动ChatGPT会卡音频模式且语音按钮没人点——直接放弃
+            status = "辅助功能未就绪，本次唤醒放弃"
+            FileLog.log("triggerSession放弃: a11y未就绪")
+            return
+        }
         sessionActive = true
         pendingEnterVoice = true
         lastUiActivity = System.currentTimeMillis()
