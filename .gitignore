@@ -1,0 +1,19 @@
+# Android build artifacts
+ButlerApp/build/
+ButlerApp/app/build/
+ButlerApp/.gradle/
+ButlerApp/local.properties
+ButlerApp/.idea/
+ButlerApp/*.iml
+
+# Vosk model（70MB，按 README 说明单独下载推送）
+*.zip
+vosk-model*/
+models/
+
+# APK 产物不入库
+*.apk
+*.xapk
+
+# OS
+.DS_Store
