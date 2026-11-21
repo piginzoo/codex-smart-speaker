@@ -1,9 +1,11 @@
 package com.piginzoo.butler
 
 import android.accessibilityservice.AccessibilityService
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.media.AudioFormat
@@ -45,6 +47,13 @@ class WakeService : Service() {
     @Volatile private var running = false
     private var lastTriggerAt = 0L
     private var lastLoggedText = ""
+    @Volatile private var lastBeatAt = 0L   // 心跳：mic循环每次迭代刷新，看门狗据此判断假死
+
+    /** 语法约束：识别器只输出这些词，环境音全部变成[unk]，防止长partial拖死识别器 */
+    private val grammar = "[\"[unk]\", \"hey codex\", \"codex\", \"kodak\", \"kodaks\", \"codecs\", \"codaks\", \"hey\", \"huh\"]"
+
+    fun isHealthy(): Boolean =
+        running && (SystemClock.elapsedRealtime() - lastBeatAt) < 30_000
 
     // 挂断看守：通话模式见过后回落到正常=会话结束
     private var commSeen = false
@@ -56,19 +65,42 @@ class WakeService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        lastBeatAt = SystemClock.elapsedRealtime()
+        FileLog.init(getExternalFilesDir(null))
+        FileLog.log("WakeService onCreate pid=${android.os.Process.myPid()}")
         startAsForeground()
         workThread = HandlerThread("wake-engine").also { it.start() }
         handler = Handler(workThread.looper)
         handler.post { initModel() }
         handler.post(hangupWatcher)   // 独立看守线程：不占麦克风
+        ButlerWatchdogReceiver.scheduleNext(this)  // 看门狗巡视启动
         Butler.status = "唤醒服务运行中"
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // 用户从最近任务划掉App：1秒后自动拉活服务
+        FileLog.log("onTaskRemoved：安排1秒后重启")
+        try {
+            val am = getSystemService(AlarmManager::class.java)
+            val pi = PendingIntent.getBroadcast(
+                this, 1002,
+                Intent(this, BootReceiver::class.java).setAction(BootReceiver.ACTION_RESTART),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            am.setExactAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 1000, pi
+            )
+        } catch (_: Exception) {}
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         running = false
         Butler.releaseScreen()
+        FileLog.log("WakeService onDestroy")
         handler.post {
             try { recognizer?.close() } catch (_: Exception) {}
             try { model?.close() } catch (_: Exception) {}
@@ -105,16 +137,18 @@ class WakeService : Service() {
         try {
             model = Model(modelPath.absolutePath)
             running = true
+            FileLog.log("模型加载完成，语法约束识别启动")
             Butler.status = "模型加载完成，开始监听"
             thread(name = "mic-loop") { listenLoop() }
         } catch (e: Exception) {
+            FileLog.log("模型加载失败：${e.message}")
             Butler.status = "模型加载失败：${e.message}"
         }
     }
 
     private fun newRecognizer(): Recognizer? {
         val m = model ?: return null
-        return try { Recognizer(m, SAMPLE_RATE.toFloat()) } catch (e: Exception) { null }
+        return try { Recognizer(m, SAMPLE_RATE.toFloat(), grammar) } catch (e: Exception) { null }
     }
 
     private fun audioManager() = getSystemService(AudioManager::class.java)
@@ -157,13 +191,15 @@ class WakeService : Service() {
     private fun listenLoop() {
         val buf = ShortArray(3200) // 200ms
         while (running) {
+            lastBeatAt = SystemClock.elapsedRealtime()
             // 会话刚结束：歇1秒换新录音器，避免音频路由残留
             if (Butler.micRestartRequested) {
                 Butler.micRestartRequested = false
+                FileLog.log("mic-loop: 会话结束，重建录音器")
                 SystemClock.sleep(1000)
                 continue
             }
-            // 语音会话期间彻底让出麦克风（对象级释放，让ChatGPT的WebRTC独占）
+            // 语音会话期间彻底让出麦克风（ChatGPT的WebRTC需要独占，三星机器上先到先得，抢麦会导致live连接饿死）
             if (Butler.sessionActive) {
                 SystemClock.sleep(1500)
                 continue
@@ -175,8 +211,10 @@ class WakeService : Service() {
             }
             var recognizer = newRecognizer()
             var failedReads = 0
+            FileLog.log("mic-loop: 本轮监听开始")
             // 本轮监听（会话一旦开始立即退出本轮）
             while (running) {
+                lastBeatAt = SystemClock.elapsedRealtime()
                 if (Butler.sessionActive || Butler.micRestartRequested) break
                 val n = try { recorder.read(buf, 0, buf.size) } catch (e: Exception) { -1 }
                 if (n <= 0) {
@@ -189,6 +227,11 @@ class WakeService : Service() {
                 if (rec == null) { SystemClock.sleep(1000); continue }
                 val hasFinal = try { rec.acceptWaveForm(buf, n) } catch (e: Exception) { false }
                 val text = extractText(rec, hasFinal)
+                // partial超长保险丝：语法模式下理论不会发生，防御性保留
+                if (!hasFinal && text != null && text.split(Regex("\\s+")).size > 10) {
+                    FileLog.log("partial超长(${text.split(Regex("\\s+")).size}词)，重置识别器")
+                    try { rec.reset() } catch (_: Exception) {}
+                }
                 if (!text.isNullOrEmpty() && text != lastLoggedText) {
                     lastLoggedText = text
                     android.util.Log.d("ButlerWake", "识别: $text")
@@ -233,6 +276,7 @@ class WakeService : Service() {
 
     private fun maybeTrigger() {
         android.util.Log.d("ButlerWake", "maybeTrigger: sessionActive=${Butler.sessionActive} pending=${Butler.pendingEnterVoice}")
+        FileLog.log("maybeTrigger: session=${Butler.sessionActive} pending=${Butler.pendingEnterVoice}")
         val now = System.currentTimeMillis()
         if (now - lastTriggerAt < 10_000) return  // 防抖10秒
         lastTriggerAt = now
@@ -252,6 +296,7 @@ class WakeService : Service() {
         Butler.releaseScreen()
         Butler.status = "会话结束：$reason"
         android.util.Log.d("ButlerWake", "exitSession: $reason")
+        FileLog.log("exitSession: $reason")
         Butler.micRestartRequested = true
         val s = ButlerAccessibilityService.instance
         if (s != null) {

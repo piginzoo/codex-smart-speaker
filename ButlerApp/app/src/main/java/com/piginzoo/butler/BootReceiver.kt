@@ -5,9 +5,16 @@ import android.content.Context
 import android.content.Intent
 
 class BootReceiver : BroadcastReceiver() {
+    companion object {
+        const val ACTION_RESTART = "com.piginzoo.butler.RESTART"
+    }
+
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            context.startForegroundService(Intent(context, WakeService::class.java))
+        when (intent.action) {
+            Intent.ACTION_BOOT_COMPLETED, ACTION_RESTART -> {
+                FileLog.log("BootReceiver: action=${intent.action}，启动服务")
+                context.startForegroundService(Intent(context, WakeService::class.java))
+            }
         }
     }
 }
