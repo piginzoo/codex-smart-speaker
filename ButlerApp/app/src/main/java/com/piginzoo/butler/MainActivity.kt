@@ -32,10 +32,6 @@ class MainActivity : Activity() {
             stopService(Intent(this, WakeService::class.java))
             refresh()
         }
-        findViewById<Button>(R.id.btnMicFree).setOnClickListener {
-            Butler.setMicFree(this, !Butler.micFree)
-            Toast.makeText(this, if (Butler.micFree) "麦克风已让出，10分钟后自动恢复" else "麦克风已恢复监听", Toast.LENGTH_SHORT).show()
-        }
         findViewById<Button>(R.id.btnTest).setOnClickListener {
             if (!Butler.a11yReady) {
                 Toast.makeText(this, "请先到系统设置开启辅助功能", Toast.LENGTH_LONG).show()

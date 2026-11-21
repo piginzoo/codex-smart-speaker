@@ -1,7 +1,6 @@
 package com.piginzoo.butler
 
 import android.accessibilityservice.AccessibilityService
-import android.content.Intent
 import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
@@ -34,16 +33,7 @@ class ButlerAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         Butler.a11yReady = true
-        FileLog.init(getExternalFilesDir(null))
-        FileLog.log("a11y onServiceConnected")
         Butler.status = "辅助功能就绪"
-        // 可靠自启：a11y被系统绑定时进程必活，若唤醒服务不在则拉起
-        //（比BOOT_COMPLETED可靠，三星开机广播偶尔吞）
-        try {
-            if (WakeService.instance == null) {
-                startForegroundService(Intent(this, WakeService::class.java))
-            }
-        } catch (_: Exception) {}
     }
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
@@ -99,7 +89,6 @@ class ButlerAccessibilityService : AccessibilityService() {
                     .append(",b=").append(r).append("] ")
             }
             android.util.Log.d("ButlerWake", sb.toString())
-            FileLog.log(sb.toString())
         }
         enterAttempts++
 
@@ -120,7 +109,6 @@ class ButlerAccessibilityService : AccessibilityService() {
             android.util.Log.d("ButlerWake", "点击语音按钮: d=${btn.contentDescription} t=${btn.text} id=${btn.viewIdResourceName} b=$r")
             val ok = btn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             android.util.Log.d("ButlerWake", "点击结果: ok=$ok")
-            FileLog.log("点击语音按钮 ok=$ok b=$r")
             if (ok) {
                 Butler.pendingEnterVoice = false
                 enteredVoice = true

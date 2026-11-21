@@ -14,7 +14,6 @@ class BootReceiver : BroadcastReceiver() {
             Intent.ACTION_BOOT_COMPLETED, ACTION_RESTART -> {
                 FileLog.log("BootReceiver: action=${intent.action}，启动服务")
                 context.startForegroundService(Intent(context, WakeService::class.java))
-                AlarmStore.rescheduleAll(context)   // 系统重启会清AlarmManager注册，开机重挂
             }
         }
     }

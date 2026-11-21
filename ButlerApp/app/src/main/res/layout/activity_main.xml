@@ -27,12 +27,6 @@
         android:text="停止唤醒服务" />
 
     <Button
-        android:id="@+id/btnMicFree"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="让出麦克风(给Bixby用)" />
-
-    <Button
         android:id="@+id/btnTest"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
