@@ -49,11 +49,13 @@ class WakeService : Service() {
         val DEFAULT_VARIANTS = listOf(
             // 小管家（实测转写：小管家/小管加/小户人家）
             "小管家", "小管加", "小馆家", "小管嫁", "小官家", "晓管家", "小管佳", "小户人家",
-            // Codex（英文词，中文模型按音转写）
+            // Codex（真人实测2026-11-22：口袋/抠死/高点死；2字词仅整句匹配防误触）
+            "口袋", "抠死", "扣死", "高点死",
             "口德克斯", "科德克斯", "扣德克斯", "寇德克斯", "克达克斯", "科达克斯",
             "扣达克斯", "口代克斯", "咳德克斯", "黑德克斯", "codex",
-            // GPT（字母读音，中文模型按音转写）
-            "几皮提", "吉皮提", "记皮提", "集皮提", "激皮提", "jipiti", "gpt", "chatgpt"
+            // GPT（真人实测2026-11-22：鼻涕/记笔记/麂皮）
+            "鼻涕", "麂皮", "记笔记",
+            "几皮提", "吉皮提", "记皮提", "集皮提", "激皮提", "gpt", "chatgpt"
         )
 
         @Volatile var instance: WakeService? = null
@@ -68,8 +70,11 @@ class WakeService : Service() {
     private var lastLoggedText = ""
     @Volatile private var lastBeatAt = 0L   // 心跳：mic循环每次迭代刷新，看门狗据此判断假死
 
-    /** 生效中的变体表（归一化后的小写无空格形式） */
-    @Volatile private var variants: List<String> = normalizeAll(DEFAULT_VARIANTS)
+    /** 生效中的变体表（归一化后小写无空格）：3字以上=整句包含即触发；2字变体=仅整句就是它才触发（防"口袋/鼻涕"这类日常词误触） */
+    @Volatile private var variantsExact: Set<String> =
+        normalizeAll(DEFAULT_VARIANTS).filter { it.length == 2 }.toSet()
+    @Volatile private var variantsContains: List<String> =
+        normalizeAll(DEFAULT_VARIANTS).filter { it.length >= 3 }
 
     fun isHealthy(): Boolean =
         running && (SystemClock.elapsedRealtime() - lastBeatAt) < 30_000
@@ -158,7 +163,7 @@ class WakeService : Service() {
         try {
             model = Model(modelPath.absolutePath)
             running = true
-            FileLog.log("模型加载完成：cn全量转写 + 变体表${variants.size}个")
+            FileLog.log("模型加载完成：cn全量转写 + 变体表(整句=${variantsExact.size}/包含=${variantsContains.size})")
             Butler.status = "监听中（小管家 / Codex / GPT）"
             thread(name = "mic-loop") { listenLoop() }
         } catch (e: Exception) {
@@ -238,9 +243,12 @@ class WakeService : Service() {
                 .filter { it.isNotEmpty() && !it.startsWith("#") }
             else emptyList()
             val merged = if (lines.isEmpty()) normalizeAll(DEFAULT_VARIANTS) else normalizeAll(lines)
-            if (merged != variants) {
-                variants = merged
-                FileLog.log("变体表更新：${variants.size}个 ${variants.take(12)}")
+            val newExact = merged.filter { it.length == 2 }.toSet()
+            val newContains = merged.filter { it.length >= 3 }
+            if (newExact != variantsExact || newContains != variantsContains) {
+                variantsExact = newExact
+                variantsContains = newContains
+                FileLog.log("变体表更新：${merged.size}个(整句=${newExact.size}/包含=${newContains.size}) 包含表:${newContains.take(8)}")
             }
         } catch (e: Exception) {
             FileLog.log("变体表加载失败：${e.message}")
@@ -337,12 +345,13 @@ class WakeService : Service() {
         JSONObject(json).optString(if (hasFinal) "text" else "partial")
     } catch (e: Exception) { null }
 
-    /** 唤醒词匹配：全量转写命中变体表任一条即触发（对partial和final都生效，响应快） */
+    /** 唤醒词匹配：3字以上变体=整句包含即触发；2字变体=整句就是它才触发（partial和final都生效，响应快） */
     private fun containsWakeWord(text: String): Boolean {
         if (Butler.sessionActive || Butler.pendingEnterVoice) return false
         val t = normalize(text)
         if (t.isEmpty()) return false
-        return variants.any { t.contains(it) }
+        if (variantsExact.contains(t)) return true
+        return variantsContains.any { t.contains(it) }
     }
 
     private fun maybeTrigger() {
