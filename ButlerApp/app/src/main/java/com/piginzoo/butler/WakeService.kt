@@ -174,6 +174,13 @@ class WakeService : Service() {
 
     private fun audioManager() = getSystemService(AudioManager::class.java)
 
+    /** 系统是否处于通话/语音会话模式（GPT live、电话等占麦场景） */
+    private fun commModeActive(): Boolean = try {
+        audioManager().mode == AudioManager.MODE_IN_COMMUNICATION
+    } catch (_: Exception) { false }
+
+    private var externalCommLogged = false
+
     /**
      * 挂断看守线程：会话期间每秒查一次系统音频模式。
      * ChatGPT语音会话开着时mode=MODE_IN_COMMUNICATION；用户挂断后回落MODE_NORMAL。
@@ -251,11 +258,22 @@ class WakeService : Service() {
                 SystemClock.sleep(1000)
                 continue
             }
-            // 语音会话期间彻底让出麦克风（ChatGPT的WebRTC需要独占，三星机器上先到先得，抢麦会导致live连接饿死）
+            // 自己唤醒的会话期间彻底让出麦克风（live接上前就得让，三星先到先得，抢麦会饿死live连接）
             if (Butler.sessionActive) {
                 SystemClock.sleep(1500)
                 continue
             }
+            // 外部语音会话占麦（用户手动开GPT live/打电话）同样让出，结束自动恢复监听
+            if (commModeActive()) {
+                if (!externalCommLogged) {
+                    externalCommLogged = true
+                    FileLog.log("mic-loop: 检测到外部语音会话(用户手动开GPT/通话)，让出麦克风")
+                    Butler.status = "外部语音会话中，麦克风已让出"
+                }
+                SystemClock.sleep(1500)
+                continue
+            }
+            externalCommLogged = false
             val recorder = openRecorder()
             if (recorder == null) { SystemClock.sleep(3000); continue }
             try { recorder.startRecording() } catch (e: Exception) {
@@ -267,7 +285,7 @@ class WakeService : Service() {
             // 本轮监听（会话一旦开始立即退出本轮）
             while (running) {
                 lastBeatAt = SystemClock.elapsedRealtime()
-                if (Butler.sessionActive || Butler.micRestartRequested) break
+                if (Butler.sessionActive || Butler.micRestartRequested || commModeActive()) break
                 val n = try { recorder.read(buf, 0, buf.size) } catch (e: Exception) { -1 }
                 if (n <= 0) {
                     if (++failedReads > 15) break

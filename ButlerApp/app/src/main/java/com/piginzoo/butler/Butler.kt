@@ -57,6 +57,18 @@ object Butler {
         lastUiActivity = System.currentTimeMillis()
         status = "已唤醒，正在拉起ChatGPT…"
         holdScreen(context)   // 会话期间屏幕常亮
+        // AI说话音量拉满：live语音走媒体/通话两条流，都调到最大
+        try {
+            val am = context.getSystemService(android.media.AudioManager::class.java)
+            am.setStreamVolume(
+                android.media.AudioManager.STREAM_MUSIC,
+                am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC), 0
+            )
+            am.setStreamVolume(
+                android.media.AudioManager.STREAM_VOICE_CALL,
+                am.getStreamMaxVolume(android.media.AudioManager.STREAM_VOICE_CALL), 0
+            )
+        } catch (_: Exception) {}
         // 1. 点亮屏幕（锁屏已禁用，turnScreenOn即可）
         context.startActivity(
             Intent(context, ScreenWakeActivity::class.java)
