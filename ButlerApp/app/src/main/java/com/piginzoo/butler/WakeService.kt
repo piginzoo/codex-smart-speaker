@@ -306,8 +306,9 @@ class WakeService : Service() {
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        // VOICE_RECOGNITION源：自带自动增益(AGC)+降噪，远场唤醒专用；MIC是原始裸麦，远/小声基本听不见
         AudioRecord(
-            MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minBuf * 4, 32000)
         ).takeIf { it.state == AudioRecord.STATE_INITIALIZED }
