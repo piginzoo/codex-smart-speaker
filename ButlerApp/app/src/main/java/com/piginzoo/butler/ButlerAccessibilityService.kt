@@ -145,7 +145,7 @@ class ButlerAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 强制外放：打开扬声器路由 + 音量拉到80%。
+     * 强制外放：打开扬声器路由 + 音量拉到100%。
      * ChatGPT live用的是通信音频模式，speakerphone开关对它生效。
      */
     private fun enforceSpeaker() {
@@ -157,13 +157,11 @@ class ButlerAccessibilityService : AccessibilityService() {
             am.isSpeakerphoneOn = true
             val maxCall = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
             if (maxCall > 0) am.setStreamVolume(
-                AudioManager.STREAM_VOICE_CALL,
-                (maxCall * 0.8).toInt().coerceAtLeast(1), 0
+                AudioManager.STREAM_VOICE_CALL, maxCall, 0
             )
             val maxMusic = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             if (maxMusic > 0) am.setStreamVolume(
-                AudioManager.STREAM_MUSIC,
-                (maxMusic * 0.8).toInt().coerceAtLeast(1), 0
+                AudioManager.STREAM_MUSIC, maxMusic, 0
             )
         } catch (_: Exception) {}
     }
